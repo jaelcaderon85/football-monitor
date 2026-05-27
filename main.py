@@ -2,6 +2,7 @@ import requests
 import time
 import logging
 from datetime import datetime
+import pytz
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -16,7 +17,13 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════
 API_KEY            = "0e6271615703dd0921b79da8260668f2"
 HEADERS            = {"x-apisports-key": API_KEY}
-INTERVALO_SEGUNDOS = 120   # cada 2 minutos
+
+INTERVALO_STATS    = 180    # revisar estadísticas cada 3 minutos
+INTERVALO_LISTA    = 900    # actualizar lista de partidos cada 15 minutos
+
+HORA_INICIO        = 10     # 10:00 AM hora Colombia
+HORA_FIN           = 15     # 3:00 PM hora Colombia
+ZONA_COLOMBIA      = pytz.timezone("America/Bogota")
 
 MINUTO_MINIMO      = 35
 CORNERS_MINIMO     = 5
@@ -44,10 +51,19 @@ LIGAS_PERMITIDAS = {
     207: "Super League",
 }
 
-# ── Anti-duplicados: no alertar el mismo partido más de una vez ───────────────
-ya_alertados = set()
+# ── Estado interno ────────────────────────────────────────────────────────────
+ya_alertados      = set()
+candidatos_cache  = []
+ultima_lista      = 0       # timestamp de la última vez que pedimos la lista
 
 # ══════════════════════════════════════════
+
+def hora_colombia():
+    return datetime.now(ZONA_COLOMBIA)
+
+def en_horario_activo():
+    hora = hora_colombia().hour
+    return HORA_INICIO <= hora < HORA_FIN
 
 def get_stat(estadisticas, nombre):
     for stat in estadisticas:
@@ -60,11 +76,29 @@ def get_stat(estadisticas, nombre):
             return int(val)
     return 0
 
+def actualizar_lista_partidos():
+    global candidatos_cache, ultima_lista
+    log.info("📡 Actualizando lista de partidos en vivo... (1 llamada API)")
+    try:
+        url = "https://v3.football.api-sports.io/fixtures?live=all"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        partidos = r.json()["response"]
+
+        candidatos_cache = [
+            p for p in partidos
+            if p["league"]["id"] in LIGAS_PERMITIDAS
+            and (p["goals"]["home"] or 0) == 0
+            and (p["goals"]["away"] or 0) == 0
+            and (p["fixture"]["status"]["elapsed"] or 0) >= MINUTO_MINIMO
+        ]
+        ultima_lista = time.time()
+        log.info(f"📋 En vivo: {len(partidos)} | Candidatos: {len(candidatos_cache)}")
+    except Exception as e:
+        log.error(f"Error obteniendo partidos: {e}")
 
 def evaluar_partido(partido, stats):
     local       = partido["teams"]["home"]["name"]
     visita      = partido["teams"]["away"]["name"]
-    liga_id     = partido["league"]["id"]
     liga_nombre = partido["league"]["name"]
     pais        = partido["league"]["country"]
     minuto      = partido["fixture"]["status"]["elapsed"] or 0
@@ -84,16 +118,8 @@ def evaluar_partido(partido, stats):
         "razon_fallo": [],
     }
 
-    if liga_id not in LIGAS_PERMITIDAS:
-        resultado["razon_fallo"].append(f"Liga no monitoreada ({liga_nombre})")
-        return resultado
-
     if goles_l != 0 or goles_v != 0:
         resultado["razon_fallo"].append(f"Hay goles ({goles_l}-{goles_v})")
-        return resultado
-
-    if minuto < MINUTO_MINIMO:
-        resultado["razon_fallo"].append(f"Minuto insuficiente ({minuto} < {MINUTO_MINIMO})")
         return resultado
 
     if not stats:
@@ -130,26 +156,16 @@ def evaluar_partido(partido, stats):
 
     if total_corners < CORNERS_MINIMO:
         resultado["razon_fallo"].append(f"Pocos corners ({total_corners} < {CORNERS_MINIMO})")
-
     if total_puerta < REMATES_PUERTA_MIN:
         resultado["razon_fallo"].append(f"Pocos remates a puerta ({total_puerta} < {REMATES_PUERTA_MIN})")
-
     if not resultado["razon_fallo"]:
         resultado["pasa_filtro"] = True
 
     return resultado
 
-
 def enviar_alerta_telegram(r):
-    """
-    Rellena BOT_TOKEN y CHAT_ID para recibir alertas en Telegram.
-    Déjalo vacío si no quieres notificaciones por ahora.
-    """
     BOT_TOKEN = "8635706048:AAFKjArS1gCqKe1g9gvVy9bQCAPcIV_PH04"
     CHAT_ID   = "5723506255"
-
-    if not BOT_TOKEN or not CHAT_ID:
-        return
 
     texto = (
         f"🚨 *PARTIDO 0-0 CON PRESIÓN*\n\n"
@@ -176,35 +192,22 @@ def enviar_alerta_telegram(r):
     except Exception as e:
         log.error(f"Error enviando Telegram: {e}")
 
-
 def ejecutar_ciclo():
-    log.info("🔄 Revisando partidos en vivo...")
+    global ultima_lista
 
-    try:
-        url = "https://v3.football.api-sports.io/fixtures?live=all"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        partidos = r.json()["response"]
-    except Exception as e:
-        log.error(f"Error obteniendo partidos: {e}")
+    # ── Actualizar lista cada 15 minutos ─────────────────────────────────────
+    if time.time() - ultima_lista >= INTERVALO_LISTA or not candidatos_cache:
+        actualizar_lista_partidos()
+
+    if not candidatos_cache:
+        log.info("⚽ Sin candidatos en este momento")
         return
 
-    # ── Pre-filtro: solo ligas permitidas y marcador 0-0 ─────────────────────
-    # Esto evita llamadas innecesarias a la API de estadísticas
-    candidatos = [
-        p for p in partidos
-        if p["league"]["id"] in LIGAS_PERMITIDAS
-        and (p["goals"]["home"] or 0) == 0
-        and (p["goals"]["away"] or 0) == 0
-        and (p["fixture"]["status"]["elapsed"] or 0) >= MINUTO_MINIMO
-    ]
-
-    log.info(f"📋 En vivo: {len(partidos)} | Candidatos tras pre-filtro: {len(candidatos)}")
+    log.info(f"🔍 Revisando estadísticas de {len(candidatos_cache)} candidatos... ({len(candidatos_cache)} llamadas API)")
 
     aprobados = 0
-
-    for partido in candidatos:
+    for partido in candidatos_cache:
         fixture_id = partido["fixture"]["id"]
-
         try:
             url_stats = f"https://v3.football.api-sports.io/fixtures/statistics?fixture={fixture_id}"
             r2 = requests.get(url_stats, headers=HEADERS, timeout=10)
@@ -217,31 +220,28 @@ def ejecutar_ciclo():
 
         if resultado["pasa_filtro"]:
             aprobados += 1
-            log.info(
-                f"🚨 {resultado['local']} vs {resultado['visita']} "
-                f"| {resultado['liga']} | min {resultado['minuto']} "
-                f"| corners {resultado['corners_l']+resultado['corners_v']} "
-                f"| remates {resultado['puerta_l']+resultado['puerta_v']}"
-            )
-
-            # ── Solo alertar si no lo hemos notificado antes ─────────────────
+            log.info(f"🚨 {resultado['local']} vs {resultado['visita']} | {resultado['liga']} | min {resultado['minuto']}")
             if fixture_id not in ya_alertados:
                 ya_alertados.add(fixture_id)
                 enviar_alerta_telegram(resultado)
-        else:
-            log.debug(f"  ✗ {resultado['local']} vs {resultado['visita']} → {' | '.join(resultado['razon_fallo'])}")
 
-    log.info(f"✅ Aprobados: {aprobados} | Próxima revisión en {INTERVALO_SEGUNDOS}s\n")
-
+    log.info(f"✅ Aprobados: {aprobados} | Próxima revisión en {INTERVALO_STATS}s")
 
 def main():
     log.info("🚀 Monitor de fútbol iniciado")
-    log.info(f"⚙️  Intervalo: {INTERVALO_SEGUNDOS}s | Min: {MINUTO_MINIMO} | Corners: {CORNERS_MINIMO} | Remates: {REMATES_PUERTA_MIN}")
+    log.info(f"⏰ Horario activo: {HORA_INICIO}:00 - {HORA_FIN}:00 hora Colombia")
+    log.info(f"⚙️  Lista: cada {INTERVALO_LISTA//60}min | Stats: cada {INTERVALO_STATS//60}min")
 
     while True:
-        ejecutar_ciclo()
-        time.sleep(INTERVALO_SEGUNDOS)
+        ahora = hora_colombia()
 
+        if en_horario_activo():
+            log.info(f"🟢 Activo — {ahora.strftime('%H:%M')} hora Colombia")
+            ejecutar_ciclo()
+            time.sleep(INTERVALO_STATS)
+        else:
+            log.info(f"🔴 Fuera de horario ({ahora.strftime('%H:%M')} COL) — duerme hasta las {HORA_INICIO}:00")
+            time.sleep(600)  # revisa cada 10 min si ya es hora
 
 if __name__ == "__main__":
     main()
